@@ -147,6 +147,22 @@ https://qdrant.tech/documentation/concepts/vectors/
 
 ---
 
+### Tabela de comparação e análise
+
+| Característica               | Dense                                    | Sparse                       |
+| ---------------------------- | ---------------------------------------- | ---------------------------- |
+| Representação                | Todos/quase todos os valores preenchidos | Maioria dos valores = 0      |
+| Dimensão                     | Fixa, ex. 384, 768, 1024, 1536           | Não precisa ter tamanho fixo |
+| Busca típica                 | Semântica                                | Lexical / termos             |
+| Modelos                      | BGE, E5, OpenAI embeddings etc.          | BM25, SPLADE, miniCOIL etc.  |
+| Encontra sinônimos/conceitos | ✅ Muito bom                              | ⚠️ Depende do modelo         |
+| Termos exatos                | ⚠️ Pode perder importância               | ✅ Muito bom                  |
+| IDs, siglas, códigos         | ⚠️                                       | ✅                            |
+| Índice Qdrant                | Normalmente HNSW                         | Sparse inverted index        |
+| Métrica                      | Cosine, Dot, Euclidean, Manhattan        | Dot Product                  |
+| Busca aproximada             | Pode usar HNSW                           | Busca sparse é exata         |
+
+
 # 5. Adicionar ou alterar campos no payload
 
 Não é necessário recriar a collection nem recalcular os embeddings.
@@ -4668,3 +4684,61 @@ Ajustes
 
 - Delete Payload:  
   https://api.qdrant.tech/api-reference/points/delete-payload
+
+---
+
+# 33. Extração TF-IDF + NER (apoio aos itens 29 e 30)
+
+**Versão:** 3.6.6  
+**Data da alteração:** 2026-08-25
+
+O golden set do item 29 pede consultas nas categorias `lexical`, `sigla`, `código` e `nome próprio`. A comparação visual do item 30 pede agrupamento por assunto (`study_group`), não só por collection.
+
+A tela **Entidades (estudo)** da aplicação lê os chunks (somente payload, sem alterar a collection) e cruza:
+
+```text
+TF-IDF (termos distintivos)
+  + NER spaCy 3.7+ pt_core_news_md (PER, ORG, LOC, MISC)
+  + regex (Lei, PC 1/2018, CNPJ, siglas)
+```
+
+A partir da **v3.6.1** o treino GLiNER roda em **CPU** no profile `gliner` (GPU continua opcional).
+
+A partir da **v3.5.0** existe a tela irmã **Entidades (GLiNER)**. O rag-demo **não** instala PyTorch: com `GLINER_BERT=true` o Compose sobe o profile `gliner` (container `gliner-bert`) com BERTimbau NER + GLiNER. O Flask só faz proxy HTTP (`GET /api/gliner-bert/status`, `POST /api/gliner-study`). A partir da **v3.6.2** os menus ficam sempre visíveis; se o container estiver desligado, a tela avisa e desativa o botão. Regex de códigos continua no rag-demo.
+
+Guia de treino (JSON BIO) e uso do checkpoint: [gliner_treino_uso.md](gliner_treino_uso.md). Resumo do serviço: [docs/gliner-bertimbau.md](docs/gliner-bertimbau.md).
+
+A saída é um **rascunho** de golden set no formato do item 29.1 (`query`, `category`, `candidate_points`). O avaliador confirma `relevant_points` antes de calcular Recall@K / MRR.
+
+Na tabela **Top TF-IDF**, a leitura é Antes (top X) → Texto → Depois (top X): os tokens imediatos mais frequentes à esquerda e à direita (sem artigos e preposições), para ajudar a reconhecer entidades compostas. O **X** é o campo **Top vizinhos** (1–30, padrão 5) nas telas Entidades (estudo) e Entidades (GLiNER).
+
+Não use spaCy 3.0: o projeto está em Python 3.12; o suporte começa na spaCy 3.7.
+
+Documentação da funcionalidade:
+
+[docs/entidades-tfidf-ner.md](docs/entidades-tfidf-ner.md)
+
+API:
+
+```http
+POST /api/entity-study
+{
+  "collection_name": "sua-collection",
+  "max_chunks": 2000,
+  "top_n": 50,
+  "neighbor_top": 5
+}
+
+GET /api/gliner-bert/status
+GET /api/gliner-models
+POST /api/gliner-reload
+POST /api/gliner-study
+{
+  "collection_name": "sua-collection",
+  "max_chunks": 200,
+  "top_n": 50,
+  "neighbor_top": 5
+}
+POST /api/gliner-train
+GET /api/gliner-train/status
+```

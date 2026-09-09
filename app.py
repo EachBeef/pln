@@ -21,6 +21,22 @@ from src.vector_store import QdrantVectorStore
 from src.storage import StorageManager
 from src.chat_rag_service import ChatManager
 from src.debug_utils import charset_debugger
+from src.entity_study_service import (
+    DEFAULT_MAX_CHUNKS,
+    DEFAULT_TOP_N,
+    CONTEXT_NEIGHBORS,
+    clamp_neighbor_top,
+    run_entity_study,
+    run_gliner_entity_study,
+)
+from src.gliner_bert_client import (
+    GlinerBertUnavailable,
+    health as gliner_health,
+    list_models as gliner_list_models,
+    reload_model as gliner_reload_model,
+    start_train as gliner_start_train,
+    train_status as gliner_train_status,
+)
 
 
 def sanitize_content(content: str) -> str:
@@ -226,6 +242,261 @@ def search_documents():
     except Exception as e:
         print(f"❌ Erro em /api/search: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def emit_entity_study_progress(step: str, progress: int, message: str):
+    """Progresso do estudo TF-IDF + NER via Socket.IO."""
+    socketio.emit('entity_study_progress', {
+        'step': step,
+        'progress': progress,
+        'message': message,
+    })
+
+
+def _golden_set_download(result: dict):
+    """Resposta HTTP com o rascunho do golden set para download."""
+    collection = result.get('collection_name', 'collection')
+    filename = f"golden_set_draft_{collection}.json"
+    return app.response_class(
+        response=json.dumps(result.get('golden_set_draft', []), ensure_ascii=False, indent=2),
+        status=200,
+        mimetype='application/json',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+    )
+
+
+def _run_entity_study_request():
+    """Executa o estudo de entidades a partir do JSON da requisição."""
+    data = request.get_json() or {}
+    collection_name = (data.get('collection_name') or '').strip()
+    if not collection_name:
+        return None, (jsonify({
+            'success': False,
+            'error': 'collection_name é obrigatório',
+        }), 400)
+
+    max_chunks = int(data.get('max_chunks', config.ENTITY_STUDY_MAX_CHUNKS or DEFAULT_MAX_CHUNKS))
+    top_n = int(data.get('top_n', DEFAULT_TOP_N))
+    neighbor_top = clamp_neighbor_top(data.get('neighbor_top', CONTEXT_NEIGHBORS))
+    max_chunks = max(1, min(max_chunks, DEFAULT_MAX_CHUNKS))
+    top_n = max(1, min(top_n, 200))
+
+    emit_entity_study_progress('reading', 15, f'Lendo chunks de {collection_name}...')
+    result = run_entity_study(
+        vector_store,
+        collection_name,
+        max_chunks=max_chunks,
+        top_n=top_n,
+        neighbor_top=neighbor_top,
+    )
+    emit_entity_study_progress(
+        'completed',
+        100,
+        f'{result["chunks_analyzed"]} chunks analisados; '
+        f'{len(result["golden_set_draft"])} candidatos ao golden set.',
+    )
+    return result, None
+
+
+@app.route('/api/entity-study', methods=['POST'])
+def entity_study():
+    """Extrai entidades (TF-IDF + NER) e gera rascunho de golden set."""
+    try:
+        result, error_response = _run_entity_study_request()
+        if error_response:
+            return error_response
+        download = (request.get_json() or {}).get('format') in ('json', 'download')
+        if download:
+            return _golden_set_download(result)
+        return jsonify({'success': True, **result})
+    except NotImplementedError as e:
+        return jsonify({'success': False, 'error': str(e)}), 501
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"❌ Erro em /api/entity-study: {e}")
+        emit_entity_study_progress('error', 0, str(e))
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/entity-study/export', methods=['POST'])
+def entity_study_export():
+    """Baixa o rascunho do golden set em JSON."""
+    try:
+        result, error_response = _run_entity_study_request()
+        if error_response:
+            return error_response
+        return _golden_set_download(result)
+    except NotImplementedError as e:
+        return jsonify({'success': False, 'error': str(e)}), 501
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"❌ Erro em /api/entity-study/export: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/gliner-bert/status', methods=['GET'])
+def gliner_bert_status():
+    """Indica se o container Torch GLiNER/BERTimbau está utilizável."""
+    payload = gliner_health()
+    available = bool(payload.get("available"))
+    train_available = bool(payload.get("train_available", available))
+    return jsonify({
+        "success": True,
+        "available": available,
+        "train_available": train_available,
+        **payload,
+    }), 200
+
+
+@app.route('/api/gliner-study', methods=['POST'])
+def gliner_study():
+    """Estudo TF-IDF + NER remoto (GLiNER/BERTimbau)."""
+    try:
+        if not config.GLINER_BERT:
+            return jsonify({
+                "success": False,
+                "available": False,
+                "error": "GLINER_BERT=false. Ative a flag no .env e suba o profile gliner.",
+            }), 503
+        data = request.get_json() or {}
+        collection_name = (data.get("collection_name") or "").strip()
+        if not collection_name:
+            return jsonify({"success": False, "error": "collection_name é obrigatório"}), 400
+        max_chunks = int(data.get("max_chunks", config.GLINER_STUDY_MAX_CHUNKS))
+        top_n = int(data.get("top_n", DEFAULT_TOP_N))
+        neighbor_top = clamp_neighbor_top(data.get("neighbor_top", CONTEXT_NEIGHBORS))
+        max_chunks = max(1, min(max_chunks, DEFAULT_MAX_CHUNKS))
+        top_n = max(1, min(top_n, 200))
+        emit_entity_study_progress("reading", 15, f"Lendo chunks de {collection_name}...")
+        emit_entity_study_progress("ner", 40, "Enviando textos ao serviço GLiNER/BERTimbau...")
+        result = run_gliner_entity_study(
+            vector_store,
+            collection_name,
+            max_chunks=max_chunks,
+            top_n=top_n,
+            neighbor_top=neighbor_top,
+            labels=config.GLINER_LABELS,
+        )
+        emit_entity_study_progress(
+            "completed",
+            100,
+            f'{result["chunks_analyzed"]} chunks; '
+            f'{len(result["golden_set_draft"])} candidatos (GLiNER/BERTimbau).',
+        )
+        download = data.get("format") in ("json", "download")
+        if download:
+            return _golden_set_download(result)
+        return jsonify({"success": True, **result})
+    except GlinerBertUnavailable as error:
+        emit_entity_study_progress("error", 0, str(error))
+        return jsonify({"success": False, "available": False, "error": str(error)}), 503
+    except Exception as error:
+        print(f"❌ Erro em /api/gliner-study: {error}")
+        emit_entity_study_progress("error", 0, str(error))
+        return jsonify({"success": False, "error": str(error)}), 500
+
+
+@app.route('/api/gliner-train', methods=['POST'])
+def gliner_train():
+    """Encaminha JSON BIO ao serviço Torch para treino assíncrono."""
+    try:
+        if not config.GLINER_BERT:
+            return jsonify({
+                "success": False,
+                "cuda_available": False,
+                "error": "GLINER_BERT=false. Ative a flag no .env e suba o profile gliner.",
+            }), 503
+        if request.files.get("file"):
+            raw = request.files["file"].read()
+            if len(raw) > config.MAX_CONTENT_LENGTH:
+                return jsonify({"success": False, "error": "Arquivo JSON grande demais."}), 413
+            payload = json.loads(raw.decode("utf-8"))
+            extra_steps = request.form.get("max_steps")
+            extra_name = request.form.get("output_name")
+            if not isinstance(payload, dict):
+                payload = {"sentences": payload}
+            if extra_steps:
+                payload["max_steps"] = int(extra_steps)
+            if extra_name:
+                payload["output_name"] = extra_name
+        else:
+            payload = request.get_json(silent=True)
+        if payload is None:
+            return jsonify({"success": False, "error": "Envie JSON BIO no body ou um arquivo .json"}), 400
+        result = gliner_start_train(payload)
+        return jsonify({"success": True, **result})
+    except json.JSONDecodeError:
+        return jsonify({"success": False, "error": "JSON BIO inválido"}), 400
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+    except GlinerBertUnavailable as error:
+        code = getattr(error, "status_code", 503) or 503
+        return jsonify({"success": False, "error": str(error)}), code
+    except Exception as error:
+        print(f"❌ Erro em /api/gliner-train: {error}")
+        return jsonify({"success": False, "error": str(error)}), 500
+
+
+@app.route('/api/gliner-train/status', methods=['GET'])
+def gliner_train_status_route():
+    """Proxy de GET /train/status."""
+    if not config.GLINER_BERT:
+        return jsonify({
+            "success": True,
+            "state": "idle",
+            "cuda_available": False,
+            "message": "GLINER_BERT=false",
+        }), 503
+    payload = gliner_train_status()
+    return jsonify({"success": True, **payload})
+
+
+@app.route('/api/gliner-models', methods=['GET'])
+def gliner_models_route():
+    """Lista o Hub e os checkpoints em volumes/gliner-checkpoints."""
+    if not config.GLINER_BERT:
+        return jsonify({
+            "success": True,
+            "available": False,
+            "current_id": "hub",
+            "checkpoints": [],
+            "error": "GLINER_BERT=false. Ative a flag no .env e suba o profile gliner.",
+        }), 200
+    try:
+        payload = gliner_list_models()
+        return jsonify({"success": True, **payload})
+    except GlinerBertUnavailable as error:
+        return jsonify({
+            "success": False,
+            "available": False,
+            "current_id": "hub",
+            "checkpoints": [],
+            "error": str(error),
+        }), 503
+
+
+@app.route('/api/gliner-reload', methods=['POST'])
+def gliner_reload_route():
+    """Carrega um checkpoint em disco (ou volta ao Hub) sem reiniciar o container."""
+    try:
+        if not config.GLINER_BERT:
+            return jsonify({
+                "success": False,
+                "error": "GLINER_BERT=false. Ative a flag no .env e suba o profile gliner.",
+            }), 503
+        data = request.get_json(silent=True) or {}
+        model_id = (data.get("id") or data.get("checkpoint") or "hub").strip() or "hub"
+        trained_only = data.get("trained_only")
+        result = gliner_reload_model(model_id, trained_only=trained_only)
+        return jsonify({"success": True, **result})
+    except GlinerBertUnavailable as error:
+        code = getattr(error, "status_code", 503) or 503
+        return jsonify({"success": False, "error": str(error)}), code
+    except Exception as error:
+        print(f"❌ Erro em /api/gliner-reload: {error}")
+        return jsonify({"success": False, "error": str(error)}), 500
 
 
 def allowed_file(filename: str) -> bool:

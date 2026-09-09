@@ -9,9 +9,10 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
-from typing import List
+from typing import TYPE_CHECKING, List
 
-from qdrant_client.models import SparseVector
+if TYPE_CHECKING:
+    from qdrant_client.models import SparseVector
 
 TOKEN_RE = re.compile(r"[a-záàâãéêíóôõúüç0-9]+", re.IGNORECASE)
 
@@ -41,8 +42,10 @@ def token_index(token: str) -> int:
     return int.from_bytes(digest[:4], "little")
 
 
-def text_to_sparse_vector(text: str) -> SparseVector:
+def text_to_sparse_vector(text: str) -> "SparseVector":
     """Converte texto em SparseVector de frequências de termo."""
+    from qdrant_client.models import SparseVector
+
     counts = Counter(tokenize(text))
     if not counts:
         return SparseVector(indices=[0], values=[0.0])
